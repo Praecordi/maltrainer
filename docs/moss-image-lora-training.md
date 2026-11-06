@@ -50,6 +50,32 @@ on). Nothing is saved but the PNGs in `<output.path>/samples/`. About 24 s per i
 `sample:` section can be edited while training runs; the trainer picks up the saved file at
 the next step (same page).
 
+## DOP: keep the subjects off other people
+
+DOP (differential output preservation, from ai-toolkit) works here as for Krea 2
+([krea2-lora-training.md](krea2-lora-training.md#dop-keep-the-likeness-off-other-people)): on a DOP
+step the caption with the trigger swapped for `train.dop_class` is run twice on the same noised
+latent and sigma, once with the adapters switched off (the target, no grad) and once with them on,
+and the LoRA is held to the base model's prediction by an MSE loss times `train.dop_multiplier`.
+
+```yaml
+train:
+  dop: true
+  dop_class: "woman"
+  dop_triggers: ["ayasedi woman", "saisheta woman"]   # several subjects; default: [dataset.trigger]
+  dop_every: 2          # a DOP pass every 2nd micro-step...
+  dop_multiplier: 2.0   # ...at twice the weight: the same preservation on average (Fizgig's recipe)
+```
+
+- **Several subjects** in one LoRA list their triggers in `train.dop_triggers`; a caption naming two of them
+  (a collage, a photo of both) has both swapped, so `a ayasedi woman` and `a saisheta woman` both become
+  `a woman`. Captions that name no trigger train as usual, with a warning.
+- The swapped captions are encoded with the training captions at the start; the progress log shows the
+  last `DOP:` loss, which starts at 0 (the LoRA starts as the base model).
+- **Cost:** a DOP step adds one forward without grad and one forward and backward, about 1.8x a plain
+  step; `dop_every: 2` brings the run to about 1.4x.
+- LoRA runs only: a finetune has no adapters to switch off and keeps other people out with `prior:`.
+
 ## Keys while training
 
 When the trainer runs in a console window (the CLI or a `.bat`), four keys act at the next step:

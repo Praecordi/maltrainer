@@ -13,6 +13,10 @@ predicts v = noise - x0, under a plain per-token MSE. By default sigmas follow t
 final pretraining interval: logit-normal (mean 1.09, std 0.95 on logit sigma), cut at 0.95 and
 rescaled onto [0, 1], 1 % uniform, no shift.
 
+train.dop (maltrainer.training.dop) adds a second pass on the same noised latent: the caption with every
+subject's trigger (train.dop_triggers, else dataset.trigger) swapped for train.dop_class, held to the base
+model's own prediction, so the subjects stay out of prompts that don't name them.
+
     python train_moss_image_lora.py --config templates/moss_image_automagic_template.yaml
 """
 
@@ -32,6 +36,7 @@ from maltrainer.trainers.moss_image.previews import PreviewHooks
 from maltrainer.trainers.moss_image.timesteps import sample_sigma
 from maltrainer.training.advice import StepAdvice
 from maltrainer.training.cli import start_run, training_arguments
+from maltrainer.training.dop import check_dop_config, dop_captions, dop_loss, dop_triggers
 from maltrainer.training.image_lora import ImageLoRATrainer
 from maltrainer.utils.compile import compile_blocks
 from maltrainer.utils.config import load_config
@@ -55,8 +60,17 @@ class MOSSImageLoRATrainer(PreviewHooks, StepAdvice, ImageLoRATrainer):
     polarity_history = 8
     strict_optimizer = True
     schedule = ("logit_normal", 1.0)
+    supports_dop = True  # the finetune has no adapters to switch off; it keeps other people with prior:
 
     def __init__(self, config: dict[str, Any], dry_run: bool = False, dry_run_step_time: float = 0.025) -> None:
+        check_dop_config(config)
+        self.dop = bool(config.get("train", {}).get("dop", False))
+        if self.dop and not self.supports_dop:
+            raise ValueError("train.dop is for MOSS-Image LoRAs; a finetune keeps other people out with prior:")
+        self.dop_captions: dict[str, str] = {}  # sample key -> its caption with the trigger(s) replaced
+        self.micro_step = 0
+        self.last_dop_loss: float | None = None
+        self._dop_inputs: tuple[torch.Tensor, torch.Tensor] | None = None  # the last step's noised latent and sigma
         self._init_previews(config)  # first: a sample: warning is logged before the device lines, as before
         super().__init__(config, dry_run=dry_run, dry_run_step_time=dry_run_step_time)
 
@@ -77,7 +91,11 @@ class MOSSImageLoRATrainer(PreviewHooks, StepAdvice, ImageLoRATrainer):
         print("VAE latents ready.", flush=True)
 
         dropout = float(self.config.get("train", {}).get("caption_dropout", 0.0) or 0.0) > 0
-        folders = prompt_folders(self.samples, dataset_config["path"], self._extra_prompts(), dropout)
+        extra = self._extra_prompts()
+        if self.dop:
+            self._plan_dop_captions()
+            extra = extra + sorted(set(self.dop_captions.values()) - set(extra))
+        folders = prompt_folders(self.samples, dataset_config["path"], extra, dropout)
         self.text_cache = cache_prompts(folders, self.config, (self.device, self.dtype), self.is_main_process)
         print("Text embeddings ready.", flush=True)
         logger.info(
@@ -86,6 +104,20 @@ class MOSSImageLoRATrainer(PreviewHooks, StepAdvice, ImageLoRATrainer):
             len(self.text_cache),
             sorted({embeds.shape[0] for embeds in self.text_cache.values()}),
         )
+
+    def _plan_dop_captions(self) -> None:
+        """DOP's caption per sample: every trigger replaced by the class word, as ai-toolkit does."""
+        train_config = self.config["train"]
+        cls = str(train_config["dop_class"]).strip()
+        triggers = dop_triggers(self.config)
+        self.dop_captions = dop_captions(self.samples, triggers, cls)
+        self.run_metadata["dop"] = {
+            "triggers": triggers,
+            "class": cls,
+            "multiplier": float(train_config.get("dop_multiplier", 1.0)),
+            "every": int(train_config.get("dop_every", 1) or 1),
+            "captions": len(self.dop_captions),
+        }
 
     # ------------------------------------------------------------------ model
 
@@ -142,10 +174,43 @@ class MOSSImageLoRATrainer(PreviewHooks, StepAdvice, ImageLoRATrainer):
         noise = torch.randn_like(x0)
         s = sigma.view(1, 1, 1, 1)
         noisy = (1.0 - s) * x0 + s * noise
+        if self.dop:
+            self._dop_inputs = (noisy.to(self.dtype), sigma)
         pred = self.lora_network(noisy.to(self.dtype), sigma, context)
         loss = torch.nn.functional.mse_loss(pred.float(), (noise - x0).float())
         strength = float(self.config["train"].get("loss_weight_strength", 1.0))
         return loss * strength if strength != 1.0 else loss
+
+    def _dop_loss(self, index: int) -> torch.Tensor | None:
+        """DOP (maltrainer.training.dop) on the training pass's noised latent and sigma; None when this sample's
+        caption names no trigger, or it isn't a DOP step (``train.dop_every``)."""
+        train_config = self.config["train"]
+        caption = self.dop_captions.get(self.samples[index][0])
+        every = max(int(train_config.get("dop_every", 1) or 1), 1)
+        if caption is None or self._dop_inputs is None or self.micro_step % every:
+            return None
+        noisy, sigma = self._dop_inputs
+        context = self.text_cache[caption].to(self.device, self.dtype).unsqueeze(0)
+        adapters = self.accelerator.unwrap_model(self.lora_network)
+        multiplier = float(train_config.get("dop_multiplier", 1.0))
+        return dop_loss(self.lora_network, adapters, (noisy, sigma, context), multiplier)
+
+    def _micro_step(self, index: int) -> torch.Tensor:
+        loss = self._training_step(index)
+        self.accelerator.backward(loss)
+        if self.dop:
+            # its own backward, so the first pass's graph is freed before the second
+            dop = self._dop_loss(index)
+            if dop is not None:
+                self.accelerator.backward(dop)
+                self.last_dop_loss = dop.item()
+            self._dop_inputs = None
+        self.micro_step += 1
+        return loss
+
+    def _step_note(self) -> str:
+        note = super()._step_note()  # the finetune's step_note
+        return f"DOP: {self.last_dop_loss:.6f}, {note}" if self.last_dop_loss is not None else note
 
     # The loop's hooks: key e opens the preview menu; the loop's monitor (train.monitor_every) gets this trainer's
     # sigma as ``last_sigma``, and its speed leaves out the previews; previews and the sample: reload run at the
