@@ -146,6 +146,23 @@ sample:
   The CPU encoding differs ~2.6% from the GPU's (the int8 layers run a float fallback on the
   CPU), so a prompt added mid-run can render slightly differently after a restart, when it is
   encoded on the GPU. These embeddings serve previews only and never enter the caption cache.
+- **Fast previews with a distillation LoRA:** `sample.loras` lists LoRAs that apply to the previews
+  only, e.g. lodestones' 8-step DMD LoRA for the model you train (the Base distillation for a Base run):
+
+  ```yaml
+  sample:
+    loras:
+      - path: /models/loras/moss/MOSS-Image-Base-8-steps-dmd.safetensors
+        strength: 1.0          # default 1.0; a bare path also works
+    steps: 8
+    cfg: 1.0                   # DMD is distilled: no CFG, so no negative is encoded either
+  ```
+
+  They are applied unmerged (forward hooks that exist only while a preview renders), so the weights
+  and the LoRA in training never see them, and a delta smaller than bf16's rounding step is kept.
+  Keys are ComfyUI's (`lora_down` / `lora_up` or `lora_A` / `lora_B`, optional `alpha`); separate
+  `q` / `k` / `v` adapters are concatenated onto a fused `qkv`. Weights stay in fp32 on the GPU
+  (~1.2 GB for a rank-128 DMD LoRA). Read at the start only; MOSS-Image trainers only.
 - **The sampler** is the reference pipeline's (`maltrainer/models/moss_image/sampling.py`): the
   shift-5 schedule snapped to the 1000 training sigmas, Euler, CFG against the negative with block
   22 skipped. The VAE decoder is the full FLUX.2 one from `model.vae_path`; MOSS-Image's own small
