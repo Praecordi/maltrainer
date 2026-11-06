@@ -16,6 +16,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from maltrainer.models.flux3.vae import load_flux2_vae_decoder
+from maltrainer.models.moss_image.extra_loras import ExtraLoRAs, specs_from
 from maltrainer.models.moss_image.sampling import sample as moss_sample
 from maltrainer.models.moss_image.text_encoder import load_moss_image_text_encoder
 from maltrainer.training.session import free_memory
@@ -44,10 +45,15 @@ class PreviewHooks:
     _config_mtime: float | None
     _cpu_encoder: Any
     _encoding: threading.Thread | None
+    _preview_lora_specs: list[tuple[str, float]]
+    _extra_loras: ExtraLoRAs | None
 
     def _init_previews(self, config: dict[str, Any]) -> None:
         # sample: previews of fixed prompts every N steps, rendered with the weights in training
         self.previews = Previews(config.get("sample"), Path(config.get("output", {}).get("path", "./output")))
+        # sample.loras: extra LoRAs (e.g. an 8-step DMD) applied unmerged for the previews only; read at the start
+        self._preview_lora_specs = specs_from(config.get("sample"))
+        self._extra_loras = None
         self._preview_decoder = None
         self.config_path = None
         self._config_mtime = None
@@ -67,7 +73,11 @@ class PreviewHooks:
             self._preview_decoder = load_flux2_vae_decoder(self.config["model"]["vae_path"], self.device)
         context = self.text_cache[prompt].to(self.device, self.dtype)
         negative = self.text_cache[p.negative].to(self.device, self.dtype) if p.cfg != 1.0 else None
-        with tqdm(total=p.steps, desc=f"Sampling ({p.current})", leave=False, disable=not self.is_main_process) as bar:
+        extras = self._preview_extra_loras()
+        with (
+            tqdm(total=p.steps, desc=f"Sampling ({p.current})", leave=False, disable=not self.is_main_process) as bar,
+            extras.applied() if extras is not None else contextlib.nullcontext(),
+        ):
 
             def on_step(done: int, total: int) -> None:
                 bar.total = total
@@ -87,6 +97,19 @@ class PreviewHooks:
             )
         image = self._preview_decoder.decode(latents)[0]
         return Image.fromarray((image.permute(1, 2, 0).cpu().numpy() * 255).round().astype("uint8"))
+
+    def _preview_extra_loras(self) -> ExtraLoRAs | None:
+        """The sample.loras adapters, loaded onto the device at the first preview that needs them."""
+        if not self._preview_lora_specs:
+            return None
+        if self._extra_loras is None:
+            network = self.lora_network
+            accelerator = getattr(self, "accelerator", None)
+            if accelerator is not None:
+                network = accelerator.unwrap_model(network)
+            transformer = getattr(network, "transformer", network)  # the finetune trains the DiT itself
+            self._extra_loras = ExtraLoRAs(transformer, self._preview_lora_specs, self.device)
+        return self._extra_loras
 
     def _watch_config(self) -> None:
         """At a step boundary: if the config file was saved since the last look, apply its sample:
