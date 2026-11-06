@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 
 class MOSSImageFinetuneTrainer(FinetuneCheckpoint, MOSSImageLoRATrainer):
+    supports_dop = False  # no adapters to switch off for the base prediction; prior: keeps other people out
+
     def __init__(self, config: dict[str, Any], dry_run: bool = False, dry_run_step_time: float = 0.025):
         super().__init__(config, dry_run=dry_run, dry_run_step_time=dry_run_step_time)
         self.run_metadata["model_type"] = "moss_image_finetune"

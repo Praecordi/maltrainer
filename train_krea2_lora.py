@@ -27,7 +27,7 @@ from maltrainer.models.krea2.text_encoder import load_krea2_text_encoder
 from maltrainer.models.krea2.timesteps import sample_sigma
 from maltrainer.models.krea2.vae import load_krea2_vae
 from maltrainer.training.cli import start_run, training_arguments
-from maltrainer.training.dop import check_dop_config, dop_captions, dop_loss
+from maltrainer.training.dop import check_dop_config, dop_captions, dop_loss, dop_triggers
 from maltrainer.training.image_lora import ImageLoRATrainer
 from maltrainer.training.session import free_memory
 from maltrainer.utils.config import load_config
@@ -100,7 +100,7 @@ class Krea2LoRATrainer(ImageLoRATrainer):
         """DOP's caption per sample: the trigger replaced by the class word, as ai-toolkit does."""
         train_config = self.config["train"]
         cls = str(train_config["dop_class"]).strip()
-        self.dop_captions = dop_captions(self.samples, str(self.config["dataset"]["trigger"]).strip(), cls)
+        self.dop_captions = dop_captions(self.samples, dop_triggers(self.config), cls)
         self.run_metadata["dop"] = {
             "class": cls,
             "multiplier": float(train_config.get("dop_multiplier", 1.0)),

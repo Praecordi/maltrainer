@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any, cast
 
 import torch
@@ -109,6 +110,7 @@ class MOSSImageLoRANetwork(nn.Module):
         skipped = tuple(f"layers.{i}." for i in self.skip_blocks)
         self.lora_layers = nn.ModuleDict()
         self.name_map: dict[str, str] = {}
+        self._active = [True]  # False inside disabled(): the wrapped Linears return their base output alone
 
         for name, module in list(transformer.named_modules()):
             if not isinstance(module, nn.Linear) or name.startswith(skipped):
@@ -120,9 +122,10 @@ class MOSSImageLoRANetwork(nn.Module):
                     continue
                 third = module.out_features // 3
                 layers = [self._add(part, module.in_features, third, rank, alpha) for part in parts]
-                self._wrap(module, layers, concat=True)
+                self._wrap(module, layers, self._active, concat=True)
             elif selected(name, targets):
-                self._wrap(module, [self._add(name, module.in_features, module.out_features, rank, alpha)])
+                layer = self._add(name, module.in_features, module.out_features, rank, alpha)
+                self._wrap(module, [layer], self._active)
         if not self.lora_layers:
             raise ValueError("No MOSS-Image modules matched the LoRA targets")
 
@@ -147,15 +150,28 @@ class MOSSImageLoRANetwork(nn.Module):
         return layer
 
     @staticmethod
-    def _wrap(module: nn.Module, loras: Sequence[nn.Module], concat: bool = False) -> None:
+    def _wrap(module: nn.Module, loras: Sequence[nn.Module], active: list[bool], concat: bool = False) -> None:
         original = module.forward
 
-        def forward(x: torch.Tensor, _orig: Any = original, _loras: Sequence[nn.Module] = loras) -> torch.Tensor:
+        def forward(
+            x: torch.Tensor, _orig: Any = original, _loras: Sequence[nn.Module] = loras, _active: Any = active
+        ) -> torch.Tensor:
             base = _orig(x)
+            if not _active[0]:
+                return cast(torch.Tensor, base)
             delta = torch.cat([lora(x) for lora in _loras], dim=-1) if concat else _loras[0](x)
             return cast(torch.Tensor, (base + delta).to(base.dtype) if delta.dtype != base.dtype else base + delta)
 
         module.forward = forward
+
+    @contextmanager
+    def disabled(self) -> Iterator[None]:
+        """Run the base model alone: every adapter is skipped until the block exits (DOP's target pass)."""
+        self._active[0] = False
+        try:
+            yield
+        finally:
+            self._active[0] = True
 
     def set_lora_dtype(self, device: torch.device | str, dtype: torch.dtype) -> None:
         self.lora_layers.to(device=device, dtype=dtype)
